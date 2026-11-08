@@ -12,8 +12,12 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 const BOTTOM_MARGIN: f64 = 90.0;
 
 pub fn setup(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("overlay") {
-        let _ = window.set_ignore_cursor_events(true);
+    // On Linux a window that was never shown has no GDK window yet, and tao panics
+    // (aborting the app) making it click-through; `show` does it there instead.
+    if cfg!(any(windows, target_os = "macos")) {
+        if let Some(window) = app.get_webview_window("overlay") {
+            let _ = window.set_ignore_cursor_events(true);
+        }
     }
 }
 
@@ -37,6 +41,10 @@ pub fn show(app: &AppHandle) {
         let _ = window.set_position(PhysicalPosition::new(x, y));
     }
     let _ = window.show();
+    // Queued after the show, so on Linux the GDK window exists by the time it runs.
+    if !cfg!(any(windows, target_os = "macos")) {
+        let _ = window.set_ignore_cursor_events(true);
+    }
     let _ = window.set_always_on_top(true);
 }
 

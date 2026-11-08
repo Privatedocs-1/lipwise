@@ -2,9 +2,9 @@
 //! plus a synthetic Ctrl/Cmd+V, and read the selection with a synthetic copy.
 //! All functions block briefly; call them off the async runtime.
 //!
-//! On macOS the keystrokes are sent from the main thread: enigo looks up the keyboard
-//! layout through Text Input Source APIs, which abort the process when called from any
-//! other thread.
+//! On macOS the keystrokes are sent from the main thread: the keyboard layout is read
+//! through Text Input Source APIs (here and in enigo), which abort the process when
+//! called from any other thread.
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -19,14 +19,152 @@ const MODIFIER: Key = Key::Meta;
 #[cfg(not(target_os = "macos"))]
 const MODIFIER: Key = Key::Control;
 
+/// A Ctrl/Cmd shortcut sent to the focused app.
+#[derive(Clone, Copy)]
+enum Shortcut {
+    Copy,
+    Paste,
+}
+
+impl Shortcut {
+    /// The key to press with Ctrl/Cmd so the app reads this shortcut whatever the
+    /// keyboard layout. `Key::Unicode('v')` looks the letter up in the active layout,
+    /// and with one that has no "v" (Russian, Greek, ...) enigo types a "v" on Windows
+    /// and presses keycode 0, the A key, on macOS.
+    #[cfg(windows)]
+    fn key(self) -> Key {
+        // Apps match the virtual-key code, which every layout gives the V key.
+        match self {
+            Shortcut::Copy => Key::C,
+            Shortcut::Paste => Key::V,
+        }
+    }
+
+    /// Call on the main thread.
+    #[cfg(target_os = "macos")]
+    fn key(self) -> Key {
+        // kVK_ANSI_C and kVK_ANSI_V, the keys on a US keyboard, if the layout can't be read.
+        let (letter, ansi) = match self {
+            Shortcut::Copy => ('c', 8),
+            Shortcut::Paste => ('v', 9),
+        };
+        let keycode = layout::command_keycode(letter).unwrap_or_else(|| {
+            log::warn!("couldn't find Cmd+{letter} in the keyboard layout; using the US key");
+            ansi
+        });
+        Key::Other(keycode.into())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn key(self) -> Key {
+        match self {
+            Shortcut::Copy => Key::Unicode('c'),
+            Shortcut::Paste => Key::Unicode('v'),
+        }
+    }
+}
+
+/// Where the active keyboard layout puts a letter for Command shortcuts. Adapted from
+/// Handy (MIT, github.com/cjpais/Handy).
+#[cfg(target_os = "macos")]
+mod layout {
+    use std::ffi::c_void;
+
+    #[link(name = "Carbon", kind = "framework")]
+    extern "C" {
+        static kTISPropertyUnicodeKeyLayoutData: *const c_void;
+        fn TISCopyCurrentKeyboardLayoutInputSource() -> *const c_void;
+        fn TISGetInputSourceProperty(source: *const c_void, key: *const c_void) -> *const c_void;
+        fn LMGetKbdType() -> u8;
+        fn UCKeyTranslate(
+            layout: *const u8,
+            keycode: u16,
+            action: u16,
+            modifiers: u32,
+            keyboard_type: u32,
+            options: u32,
+            dead_key_state: *mut u32,
+            max_len: usize,
+            len: *mut usize,
+            chars: *mut u16,
+        ) -> i32;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
+        fn CFRelease(value: *const c_void);
+    }
+
+    const KEY_ACTION_DISPLAY: u16 = 3; // kUCKeyActionDisplay
+    const NO_DEAD_KEYS: u32 = 1; // kUCKeyTranslateNoDeadKeysMask
+    const COMMAND: u32 = 1; // cmdKey (bit 8), shifted right 8 as UCKeyTranslate expects
+
+    /// Releases a Text Input Source reference.
+    struct Source(*const c_void);
+
+    impl Drop for Source {
+        fn drop(&mut self) {
+            // SAFETY: a Create Rule reference this struct owns.
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    /// The keycode the active layout reads as `letter` while Command is held, which is
+    /// what apps match shortcuts on. Non-Latin layouts (Russian, Greek, ...) switch to
+    /// QWERTY under Command, so there it's the US key, while Dvorak keeps its own
+    /// letters. None if the layout can't be read or has no such key. Main thread only.
+    pub fn command_keycode(letter: char) -> Option<u16> {
+        let want = u16::try_from(u32::from(letter)).ok()?;
+        // SAFETY: called on the main thread. The source follows the Create Rule and is
+        // released when `source` drops; the layout bytes it owns stay valid until then.
+        // Every out-pointer is to a local of the declared size.
+        unsafe {
+            let source = TISCopyCurrentKeyboardLayoutInputSource();
+            if source.is_null() {
+                return None;
+            }
+            let source = Source(source);
+            let data = TISGetInputSourceProperty(source.0, kTISPropertyUnicodeKeyLayoutData);
+            if data.is_null() {
+                return None;
+            }
+            let layout = CFDataGetBytePtr(data);
+            if layout.is_null() {
+                return None;
+            }
+            let keyboard_type = u32::from(LMGetKbdType());
+            for keycode in 0..128 {
+                let (mut dead_keys, mut len, mut chars) = (0, 0, [0u16; 4]);
+                let status = UCKeyTranslate(
+                    layout,
+                    keycode,
+                    KEY_ACTION_DISPLAY,
+                    COMMAND,
+                    keyboard_type,
+                    NO_DEAD_KEYS,
+                    &mut dead_keys,
+                    chars.len(),
+                    &mut len,
+                    chars.as_mut_ptr(),
+                );
+                if status == 0 && len == 1 && chars[0] == want {
+                    return Some(keycode);
+                }
+            }
+            None
+        }
+    }
+}
+
 fn enigo() -> Result<Enigo> {
     Enigo::new(&Settings::default()).map_err(|e| anyhow!("Keyboard control unavailable: {e}"))
 }
 
-fn chord(enigo: &mut Enigo, key: char) -> Result<()> {
+fn chord(enigo: &mut Enigo, key: Key) -> Result<()> {
     let run = |e: &mut Enigo| -> enigo::InputResult<()> {
         e.key(MODIFIER, Direction::Press)?;
-        e.key(Key::Unicode(key), Direction::Click)?;
+        e.key(key, Direction::Click)?;
         e.key(MODIFIER, Direction::Release)
     };
     run(enigo).map_err(|e| anyhow!("Couldn't send keystroke: {e}"))
@@ -45,13 +183,13 @@ fn release_modifiers(enigo: &mut Enigo) {
     }
 }
 
-/// Releases any held modifiers, waits `settle`, then sends Ctrl/Cmd+`key`.
-fn shortcut(app: &AppHandle, key: char, settle: Duration) -> Result<()> {
+/// Releases any held modifiers, waits `settle`, then sends the shortcut.
+fn shortcut(app: &AppHandle, shortcut: Shortcut, settle: Duration) -> Result<()> {
     let press = move || -> Result<()> {
         let mut enigo = enigo()?;
         release_modifiers(&mut enigo);
         sleep(settle);
-        chord(&mut enigo, key)
+        chord(&mut enigo, shortcut.key())
     };
     if cfg!(target_os = "macos") {
         // Runs inline if this already is the main thread, so waiting can't deadlock.
@@ -75,7 +213,7 @@ pub fn paste(app: &AppHandle, text: &str, restore_clipboard: bool) -> Result<()>
     clipboard.set_text(text)?;
     sleep(Duration::from_millis(40));
 
-    shortcut(app, 'v', Duration::ZERO)?;
+    shortcut(app, Shortcut::Paste, Duration::ZERO)?;
 
     if let Some(previous) = previous {
         // Give the target app time to read the clipboard before swapping it back.
@@ -224,7 +362,7 @@ pub fn copy_selection(app: &AppHandle) -> Result<String> {
     let sentinel = format!("\u{2063}lipwise-{}", std::process::id());
     clipboard.set_text(sentinel.clone())?;
 
-    shortcut(app, 'c', Duration::from_millis(30))?;
+    shortcut(app, Shortcut::Copy, Duration::from_millis(30))?;
 
     let mut selection = String::new();
     for _ in 0..10 {

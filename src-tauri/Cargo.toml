@@ -1,6 +1,6 @@
 [package]
 name = "lipwise"
-version = "0.1.1"
+version = "0.1.2"
 description = "Lipwise — voice dictation with an AI editor in the loop"
 edition = "2021"
 license = "MIT"
